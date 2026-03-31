@@ -2,13 +2,13 @@ import { useState } from 'react';
 import { useParams, useNavigate, Link, useSearchParams } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
 import {
-  ArrowLeft, Send, Hash, MessageSquare, Bird,
+  ArrowLeft, Send, Hash, MessageSquare, Bird, Globe,
   CheckCircle2, Clipboard,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { channels as channelsApi } from '../lib/api';
 
-type ChannelType = 'telegram' | 'discord' | 'slack' | 'feishu' | 'dingtalk';
+type ChannelType = 'telegram' | 'discord' | 'slack' | 'feishu' | 'dingtalk' | 'web-widget';
 
 interface FieldDef {
   name: string;
@@ -40,6 +40,10 @@ function useChannelFields(): Record<ChannelType, FieldDef[]> {
       { name: 'clientId', label: t('channelSetup.fields.clientId'), placeholder: 'dingxxxxxxxxxx' },
       { name: 'clientSecret', label: t('channelSetup.fields.clientSecret'), placeholder: 'xxxxxxxxxxxxxxxx', type: 'password' },
     ],
+    'web-widget': [
+      { name: 'clientId', label: 'Client ID', placeholder: t('channelSetup.webWidget.clientIdPlaceholder', 'From CDK deployment output') },
+      { name: 'clientSecret', label: 'Client Secret', placeholder: t('channelSetup.webWidget.clientSecretPlaceholder', 'From CDK deployment output'), type: 'password' },
+    ],
   };
 }
 
@@ -51,6 +55,7 @@ function useChannelMeta(): Record<ChannelType, { icon: React.ReactNode; label: s
     slack: { icon: <MessageSquare size={20} />, label: t('channelSetup.slack.label'), desc: t('channelSetup.slack.desc') },
     feishu: { icon: <Bird size={20} />, label: t('channelSetup.feishu.label'), desc: t('channelSetup.feishu.desc') },
     dingtalk: { icon: <MessageSquare size={20} />, label: t('channelSetup.dingtalk.label'), desc: t('channelSetup.dingtalk.desc') },
+    'web-widget': { icon: <Globe size={20} />, label: t('channelSetup.webWidget.label', 'Web Widget'), desc: t('channelSetup.webWidget.desc', 'Website embed') },
   };
 }
 
@@ -937,6 +942,35 @@ export default function ChannelSetup() {
     );
   }
 
+  if (connected && channelType === 'web-widget') {
+    return (
+      <div className="max-w-2xl mx-auto space-y-6">
+        <Link to={`/bots/${botId}`} className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-700 transition-colors">
+          <ArrowLeft size={16} />
+          {t('common.backToBot')}
+        </Link>
+        <h1 className="text-2xl font-semibold text-slate-900">{t('channelSetup.addChannel')}</h1>
+        <div className="border border-green-300 bg-green-50 rounded-xl p-5 space-y-4 text-sm">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 size={20} className="text-green-600" />
+            <h3 className="font-semibold text-green-900 text-base">
+              {t('channelSetup.webWidget.connectedTitle', 'Channel registered successfully')}
+            </h3>
+          </div>
+          <p className="text-green-800">
+            {t('channelSetup.webWidget.connectedDesc', 'Widget is now available via WebSocket /ws/widget endpoint.')}
+          </p>
+        </div>
+        <button
+          onClick={() => navigate(`/bots/${botId}`)}
+          className="w-full rounded-lg bg-accent-500 text-white px-4 py-2.5 text-sm font-medium hover:bg-accent-600 transition-colors"
+        >
+          {t('channelSetup.doneBackToBot')}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-2xl mx-auto">
       <Link to={`/bots/${botId}`} className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-700 transition-colors mb-4">
@@ -955,7 +989,7 @@ export default function ChannelSetup() {
         <div className="bg-white border border-slate-200 p-6 rounded-xl">
           <label className="block text-sm font-medium text-slate-700 mb-3">{t('channelSetup.channelType')}</label>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            {(['telegram', 'discord', 'slack', 'feishu', 'dingtalk'] as ChannelType[]).map((type) => {
+            {(['telegram', 'discord', 'slack', 'feishu', 'dingtalk', 'web-widget'] as ChannelType[]).map((type) => {
               const meta = channelMeta[type];
               const selected = channelType === type;
               return (

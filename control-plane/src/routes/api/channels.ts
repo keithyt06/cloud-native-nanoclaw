@@ -1,6 +1,7 @@
 // ClawBot Cloud — Channels API Routes
 // CRUD operations for channel management (BYOK credentials)
 
+import { randomUUID } from 'node:crypto';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import {
@@ -23,13 +24,14 @@ import { verifyChannelCredentials } from '../../channels/index.js';
 import * as telegram from '../../channels/telegram.js';
 import { getFeishuGatewayManager } from '../../feishu/gateway-manager.js';
 import { getDingTalkGatewayManager } from '../../dingtalk/gateway-manager.js';
+import { getWebWidgetGatewayManager } from '../../web-widget/gateway-manager.js';
 import type { ChannelConfig, CreateChannelRequest } from '@clawbot/shared';
 
 const secrets = new SecretsManagerClient({ region: config.region });
 
 const createChannelSchema = z.object({
-  channelType: z.enum(['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'dingtalk']),
-  credentials: z.record(z.string(), z.string()),
+  channelType: z.enum(['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'dingtalk', 'web-widget']),
+  credentials: z.record(z.string(), z.string()).optional().default({}),
 });
 
 export const channelsRoutes: FastifyPluginAsync = async (app) => {
@@ -67,15 +69,25 @@ export const channelsRoutes: FastifyPluginAsync = async (app) => {
 
     // 1. Verify credentials are valid by calling the channel API
     let verifiedInfo: Record<string, string>;
-    try {
-      verifiedInfo = await verifyChannelCredentials(
-        body.channelType,
-        body.credentials,
-      );
-    } catch (err) {
-      return reply.status(400).send({
-        error: `Failed to verify ${body.channelType} credentials: ${(err as Error).message}`,
-      });
+    if (body.channelType === 'web-widget') {
+      // web-widget: accept user-provided credentials from CDK project
+      const clientId = body.credentials.clientId?.trim();
+      const clientSecret = body.credentials.clientSecret?.trim();
+      if (!clientId || !clientSecret) {
+        return reply.status(400).send({ error: 'web-widget requires non-empty clientId and clientSecret' });
+      }
+      verifiedInfo = { clientId, verified: 'true' };
+    } else {
+      try {
+        verifiedInfo = await verifyChannelCredentials(
+          body.channelType,
+          body.credentials,
+        );
+      } catch (err) {
+        return reply.status(400).send({
+          error: `Failed to verify ${body.channelType} credentials: ${(err as Error).message}`,
+        });
+      }
     }
 
     // 2. Generate webhook secret upfront (for Telegram) so it can be persisted
@@ -98,11 +110,13 @@ export const channelsRoutes: FastifyPluginAsync = async (app) => {
 
     // 4. Determine channel ID from verified info
     const channelId =
-      verifiedInfo.botId ||
-      verifiedInfo.applicationId ||
-      verifiedInfo.botUserId ||
-      verifiedInfo.botOpenId ||
-      'default';
+      body.channelType === 'web-widget'
+        ? verifiedInfo.clientId
+        : verifiedInfo.botId ||
+          verifiedInfo.applicationId ||
+          verifiedInfo.botUserId ||
+          verifiedInfo.botOpenId ||
+          'default';
 
     // 5. Build webhook URL
     const webhookBase =
@@ -126,6 +140,9 @@ export const channelsRoutes: FastifyPluginAsync = async (app) => {
       autoConnected = true;
     } else if (body.channelType === 'dingtalk') {
       // Stream mode — auto-connect via gateway manager
+      autoConnected = true;
+    } else if (body.channelType === 'web-widget') {
+      // Web widget — no webhook needed, auto-connect immediately
       autoConnected = true;
     } else {
       // Discord, Slack, WhatsApp require manual webhook configuration
@@ -182,6 +199,7 @@ export const channelsRoutes: FastifyPluginAsync = async (app) => {
       ...channel,
       credentialSecretArn: '[redacted]',
       ...(setupInstructions ? { setupInstructions } : {}),
+      ...(body.channelType === 'web-widget' ? { clientId: verifiedInfo.clientId } : {}),
     });
   });
 
@@ -348,6 +366,16 @@ export const channelsRoutes: FastifyPluginAsync = async (app) => {
         const dingtalkGw = getDingTalkGatewayManager();
         if (dingtalkGw) {
           dingtalkGw.removeBot(botId);
+        }
+      }
+
+      // Signal the web-widget gateway manager to remove channel and close connections
+      if (channelType === 'web-widget') {
+        const widgetGw = getWebWidgetGatewayManager();
+        if (widgetGw) {
+          widgetGw.removeChannel(channel.channelId).catch((err) => {
+            request.log.warn({ err, botId, channelId: channel.channelId }, 'Failed to remove web-widget channel from gateway');
+          });
         }
       }
 
