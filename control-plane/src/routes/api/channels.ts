@@ -195,6 +195,16 @@ export const channelsRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
+    // Hot-load web-widget channel into gateway manager cache
+    if (body.channelType === 'web-widget') {
+      const widgetGw = getWebWidgetGatewayManager();
+      if (widgetGw) {
+        widgetGw.addChannel(channel.channelId).catch((err) => {
+          request.log.error({ err, botId }, 'Failed to hot-load web-widget channel');
+        });
+      }
+    }
+
     return reply.status(201).send({
       ...channel,
       credentialSecretArn: '[redacted]',

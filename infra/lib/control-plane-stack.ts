@@ -339,6 +339,9 @@ export class ControlPlaneStack extends cdk.Stack {
         healthyThresholdCount: 2,
         unhealthyThresholdCount: 3,
       },
+      // Short deregistration delay so draining tasks release the web-widget
+      // leader lock quickly (SIGTERM arrives after this period).
+      deregistrationDelay: cdk.Duration.seconds(30),
     });
 
     this.alb.addListener('HttpListener', {

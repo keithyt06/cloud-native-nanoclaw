@@ -56,6 +56,11 @@ export class WebWidgetAdapter extends BaseChannelAdapter {
   constructor(parentLogger: import('pino').Logger) {
     super(parentLogger);
     this.init();
+    // Prevent leader reacquisition during ECS task draining.
+    // SIGTERM arrives before adapter.stop() is called by Fastify shutdown.
+    process.once('SIGTERM', () => {
+      this.stopped = true;
+    });
   }
 
   // -- Lifecycle --------------------------------------------------------------

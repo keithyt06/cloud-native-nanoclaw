@@ -18,3 +18,4 @@ infra/cdk-outputs.json
 cdk.context.jsonweb-console/.env.production
 infra/cdk.context.json
 openclaw/
+.gstack/

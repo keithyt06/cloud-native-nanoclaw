@@ -6,10 +6,12 @@ import {
   SQSClient,
   ReceiveMessageCommand,
   DeleteMessageCommand,
+  ChangeMessageVisibilityCommand,
 } from '@aws-sdk/client-sqs';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.js';
 import { getRegistry } from '../adapters/registry.js';
+import { getWebWidgetGatewayManager } from '../web-widget/gateway-manager.js';
 import type { ReplyContext } from '@clawbot/shared/channel-adapter';
 import type { ChannelType, SqsReplyPayload } from '@clawbot/shared';
 import type { Logger } from 'pino';
@@ -55,6 +57,26 @@ async function replyLoop(logger: Logger): Promise<void> {
       for (const msg of result.Messages) {
         try {
           const payload: SqsReplyPayload = JSON.parse(msg.Body!);
+
+          // Web-widget replies must be handled by the leader instance (which
+          // holds in-memory WebSocket connections). Other channel types use
+          // external REST APIs and are unaffected by this check.
+          if (payload.channelType === 'web-widget') {
+            const widgetGw = getWebWidgetGatewayManager();
+            if (!widgetGw || !widgetGw.isLeader()) {
+              // Release message with a short delay (5s) to avoid tight bounce
+              // loops when no leader exists yet. The leader will pick it up
+              // once elected (typically within 15–30s).
+              await sqs.send(
+                new ChangeMessageVisibilityCommand({
+                  QueueUrl: config.queues.replies,
+                  ReceiptHandle: msg.ReceiptHandle!,
+                  VisibilityTimeout: 5,
+                }),
+              );
+              continue;
+            }
+          }
 
           // Route reply through adapter registry
           const registry = getRegistry();

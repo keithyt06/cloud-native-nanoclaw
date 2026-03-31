@@ -30,18 +30,18 @@ Fargate Control Plane (HTTP API):
 
 ### 8.2 各 Channel 类型对比
 
-| | Telegram | Discord | Slack | Feishu/Lark |
-|---|---|---|---|---|
-| 认证方式 | Bot Token | Bot Token + Public Key | Bot Token + Signing Secret | App ID + App Secret + Encrypt Key + Verification Token |
-| 连接模式 | Webhook | Gateway (WebSocket) + Leader 选举 | Webhook (Events API) | **WebSocket 长连接 (Lark SDK WSClient) + Leader 选举** |
-| 消息格式 | Update JSON | Interaction JSON | Event JSON | Event v2.0 JSON (im.message.receive_v1) |
-| 签名验证 | secret_token header | Ed25519 签名 | HMAC-SHA256 | SDK 内部处理 (WebSocket 模式无需手动验证) |
-| 群组支持 | 是 | 是 (Guild) | 是 (Channel) | 是 (群组 + 话题线程) |
-| 回复方式 | sendMessage API | REST API | chat.postMessage | im.message.create / im.message.reply (卡片消息优先) |
-| 域名支持 | — | — | — | 飞书 (feishu.cn) / Lark (larksuite.com) |
-| 特殊能力 | — | Slash Commands、Rich Embeds | — | 卡片消息、Reaction 确认、MCP 文档/知识库/云盘工具 |
-| 用户侧配置 | 只需 Bot Token | Token + 回调 URL 配置 | App 安装 + 权限 | 飞书开放平台创建自建应用 + 权限申请 |
-| 接入难度 | 低 | 中 | 中 | 中 |
+| | Telegram | Discord | Slack | Feishu/Lark | DingTalk | **Web Widget** |
+|---|---|---|---|---|---|---|
+| 认证方式 | Bot Token | Bot Token + Public Key | Bot Token + Signing Secret | App ID + App Secret + Encrypt Key + Verification Token | Client ID + Client Secret | **Client ID + Client Secret (JWT HMAC-SHA256)** |
+| 连接模式 | Webhook | Gateway (WebSocket) + Leader 选举 | Webhook (Events API) | WebSocket 长连接 (Lark SDK WSClient) + Leader 选举 | Stream 长连接 + Leader 选举 | **WebSocket (`/ws/widget`) + Leader 选举** |
+| 消息格式 | Update JSON | Interaction JSON | Event JSON | Event v2.0 JSON | Stream Callback JSON | **JSON over WebSocket** |
+| 签名验证 | secret_token header | Ed25519 签名 | HMAC-SHA256 | SDK 内部处理 | SDK 内部处理 | **JWT HS256 (clientSecret 签名)** |
+| 群组支持 | 是 | 是 (Guild) | 是 (Channel) | 是 (群组 + 话题线程) | 是 (群组) | **是 (per-user session: `ww#{channelId}#{userId}`)** |
+| 回复方式 | sendMessage API | REST API | chat.postMessage | im.message.create / im.message.reply | REST API | **Leader 内存 WebSocket 推送 (非 Leader 经 SQS 转发)** |
+| 域名支持 | — | — | — | 飞书 (feishu.cn) / Lark (larksuite.com) | — | **任意域名 (iframe 嵌入)** |
+| 特殊能力 | — | Slash Commands、Rich Embeds | — | 卡片消息、Reaction 确认、MCP 文档/知识库/云盘工具 | — | **文件上传 (presigned S3)、聊天历史、嵌入式 UI** |
+| 用户侧配置 | 只需 Bot Token | Token + 回调 URL 配置 | App 安装 + 权限 | 飞书开放平台创建自建应用 + 权限申请 | 企业内部应用 + Stream 模式 | **Console 创建 Channel → 拿 channelId + secret → 嵌入 iframe** |
+| 接入难度 | 低 | 中 | 中 | 中 | 中 | **低** |
 
 ### 8.3 Webhook 签名验证
 
@@ -391,7 +391,203 @@ Agent 调用 feishu_doc(action="append", document_id="ABC123", content="## 修�
 Agent 回复用户: "已将修改建议追加到文档末尾"
 ```
 
-### 8.8 多媒体消息处理
+### 8.8 Web Widget 渠道
+
+Web Widget 是可嵌入任意网站的聊天组件，通过 WebSocket 实时通信。与其他渠道最大的区别：**入站和出站都通过同一条 WebSocket 连接**，回复只能由持有连接的 Leader 实例推送。
+
+#### 8.8.1 架构概览
+
+```
+用户浏览器                        CloudFront                   ALB                    ECS Fargate
+┌─────────────┐    wss://      ┌──────────┐    /ws/*     ┌────────┐            ┌──────────────────┐
+│ Chat Widget │ ──────────────►│ CDN      │────────────►│  ALB   │───────────►│ Leader Instance  │
+│ (iframe)    │◄───────────────│ /ws/*    │◄────────────│        │◄───────────│  ├─ WebSocket 连接 │
+└─────────────┘   push reply   └──────────┘             └────────┘            │  ├─ Channel Cache │
+                                                                              │  └─ Reply Push    │
+                                                                              ├──────────────────┤
+                                                                              │ Non-Leader       │
+                                                                              │  ├─ Dispatcher   │
+                                                                              │  └─ SQS Forward ─┼──► SQS Reply Queue ──► Leader Reply Consumer
+                                                                              └──────────────────┘
+```
+
+#### 8.8.2 凭证与认证
+
+```typescript
+// Secrets Manager: nanoclawbot/{stage}/{botId}/web-widget
+interface WebWidgetCredentials {
+  clientId: string;      // Channel ID (UUID), 前端标识
+  clientSecret: string;  // HMAC-SHA256 签名密钥
+}
+```
+
+**JWT 认证流程：**
+
+```
+前端 Widget:
+  1. 用 clientSecret + Web Crypto API 生成 HS256 JWT
+     Payload: { sub: userId, userId, name, iat, exp (1h) }
+  2. 建立 WebSocket: wss://{domain}/ws/widget?clientId={id}&token={jwt}
+
+服务端 (GatewayManager):
+  1. 从 channelCache 查找 clientId → 获取 clientSecret
+  2. 验证 JWT 签名 + 过期时间
+  3. 建立连接, 发送 { type: "connected", connectionId, userId }
+```
+
+#### 8.8.3 Leader 选举机制
+
+与 Discord/Feishu/DingTalk 相同的 DynamoDB 分布式锁模式，但有一个关键区别：**回复也必须经过 Leader**。
+
+```
+Leader 选举 (DynamoDB 分布式锁)
+─────────────────────────────────
+锁表:     sessions (PK=__system__, SK=web-widget-gateway-leader)
+锁 TTL:   30 秒
+续约:     每 15 秒
+Standby:  每 15 秒轮询, 初始 5 秒快速检查
+
+Anti-Pattern 防护 (滚动部署场景):
+  ├── SIGTERM → 立即设 stopped=true, 阻止 draining 实例重新竞选
+  └── ALB deregistrationDelay=30s → 缩短 SIGTERM 到达时间
+```
+
+**其他 Channel vs Web Widget 的回复路径差异：**
+
+```
+Telegram/Discord/Slack/Feishu/DingTalk:
+  任何实例 → 调外部 REST API → 发送回复  ✅ (无需 Leader)
+
+Web Widget:
+  Leader 实例 → 推送到内存 WebSocket 连接  ✅
+  Non-Leader → 本地无连接 → 转发到 SQS Reply Queue → Leader 消费 → 推送
+```
+
+#### 8.8.4 WebWidgetGatewayManager
+
+```
+start() (Leader 调用):
+  ├── reloadChannels(): 从 DynamoDB + Secrets Manager 加载所有 web-widget channels
+  ├── 构建 channelCache: Map<clientId, { channel, secret }>
+  └── 就绪, 接受 WebSocket 连接
+
+handleConnection(ws, request):
+  ├── 检查 isLeader (否则 close 1013)
+  ├── 解析 ?clientId & ?token
+  ├── channelCache.get(clientId) → 获取 secret
+  ├── verifyJwt(token, secret) → 提取 userId, userName
+  ├── 创建 connection { ws, channelId, userId, botId, groupJid }
+  ├── 存入 connections Map (connId = channelId:userId:timestamp)
+  └── 发送 { type: "connected" }
+
+动态管理:
+  ├── addChannel(channelId)    → Channel 创建时热加载到缓存
+  └── removeChannel(channelId) → Channel 删除时清缓存 + 关闭连接
+```
+
+#### 8.8.5 消息流 — 入站
+
+```
+用户在 Widget 发送消息
+  │
+  ▼
+WebSocket JSON: { action: "sendMessage", text: "...", attachments: [...] }
+  │
+  ▼
+WebWidgetGatewayManager (Leader) → handleSendMessage():
+  │
+  ├── 1. 处理附件
+  │      ├── inline (base64 data): 解码 → 上传 S3
+  │      └── s3Key (已上传): 直接引用
+  │
+  ├── 2. 群组管理
+  │      ├── groupJid = ww#{channelId}#{userId}
+  │      └── 自动创建 Group (DynamoDB)
+  │
+  ├── 3. 存储 Message (DynamoDB)
+  │
+  ├── 4. 发送 ACK: { type: "ack", messageId }
+  │
+  └── 5. 入队 SQS FIFO
+         ├── MessageGroupId: {botId}#ww#{channelId}#{userId}
+         └── replyContext: { webWidgetChannelId, webWidgetUserId }
+```
+
+#### 8.8.6 消息流 — 出站 (Agent 回复)
+
+Web Widget 的出站回复有两条路径，取决于 SQS 消息被哪个实例消费：
+
+```
+路径 A: Leader 实例处理 (理想情况)
+─────────────────────────────────
+SQS Message Consumer (Leader)
+  → dispatcher → sendChannelReply()
+  → isLeader? YES
+  → adapter.sendReply(ctx, text)
+  → pushToGroup(groupJid) → 找到内存中的 WebSocket 连接
+  → ws.send({ type: "message", text, sender: "bot" })
+  ✅ 直接推送
+
+路径 B: Non-Leader 实例处理 (需要转发)
+───────────────────────────────────────
+SQS Message Consumer (Non-Leader)
+  → dispatcher → sendChannelReply()
+  → isLeader? NO
+  → 构造 SqsReplyPayload → 发送到 SQS Reply Queue
+  → Leader 的 Reply Consumer 接收
+  → adapter.sendReply(ctx, text)
+  → pushToGroup(groupJid) → WebSocket 推送
+  ✅ 间接推送 (额外 ~1-5s 延迟)
+
+Reply Consumer 防护:
+  Non-Leader 接到 web-widget 回复 → ChangeMessageVisibility(5s) → 释放
+  Leader 接到 → 正常处理 → 推送 → 删除消息
+```
+
+#### 8.8.7 WebSocket 消息协议
+
+**Client → Server:**
+
+| action | 说明 | 字段 |
+|--------|------|------|
+| `sendMessage` | 发送消息 | text, attachments? |
+| `requestUploadUrl` | 请求 S3 预签名 URL | fileName, mimeType, size |
+| `getHistory` | 获取聊天历史 | limit? (default 50) |
+
+**Server → Client:**
+
+| type | 说明 | 字段 |
+|------|------|------|
+| `connected` | 连接成功 | connectionId, userId, userName |
+| `ack` | 消息确认 | messageId |
+| `message` | 文本消息 | text, sender, timestamp |
+| `image` | 图片消息 | url (presigned S3), fileName, mimeType, sender |
+| `file` | 文件消息 | url (presigned S3), fileName, mimeType, sender |
+| `uploadUrl` | 预签名上传 URL | uploadUrl, s3Key, expiresIn |
+| `history` | 历史消息数组 | messages[] |
+| `error` | 错误 | message |
+
+#### 8.8.8 前端 Widget 部署
+
+```
+CDK Stack: ClawbotWebWidgetStack (独立项目)
+  ├── AWS Amplify Hosting (WEB_COMPUTE)
+  ├── 环境变量:
+  │   ├── VITE_NANOCLAW_WS_URL  → wss://{cloudfront-domain}
+  │   ├── VITE_CHANNEL_ID       → channelId (UUID)
+  │   └── VITE_CLIENT_SECRET    → clientSecret (HMAC 密钥)
+  └── 部署: zip → Amplify create-deployment → start-deployment
+
+嵌入方式:
+  <iframe src="https://{amplify-domain}?userId=USER_ID"
+          style="width:400px;height:600px;border:none;" />
+
+文件上传策略:
+  ├── ≤ 5MB: base64 内联 (前端编码, 随 sendMessage 一起发送)
+  └── > 5MB: requestUploadUrl → S3 presigned PUT → sendMessage(s3Key)
+```
+
+### 8.9 多媒体消息处理
 
 Telegram/Discord/Slack/WhatsApp 消息可能包含图片、文件、语音、视频。当前核心流程只处理文本，多媒体需要额外的处理链路。
 

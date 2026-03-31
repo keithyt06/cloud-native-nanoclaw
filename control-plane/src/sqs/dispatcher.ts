@@ -2,7 +2,7 @@
 // Core message processing: the cloud equivalent of NanoClaw's message loop
 // Receives SQS messages, loads context, invokes agent, stores reply, sends to channel
 
-import type { Message as SQSMessage } from '@aws-sdk/client-sqs';
+import { type Message as SQSMessage, SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
@@ -20,6 +20,7 @@ import type {
 } from '@clawbot/shared';
 import type { ModelProvider, ProviderType, Session } from '@clawbot/shared';
 import { config } from '../config.js';
+import { getWebWidgetGatewayManager } from '../web-widget/gateway-manager.js';
 import {
   getGroup,
   ensureUser,
@@ -613,6 +614,13 @@ async function resolveSkillPrefixes(bot: Bot): Promise<string[]> {
 
 const agentcoreClient = new BedrockAgentCoreClient({ region: config.region });
 
+// Lazy-init SQS client for web-widget reply forwarding (only created when needed)
+let _replyForwardSqs: SQSClient | null = null;
+function replyForwardSqs(): SQSClient {
+  if (!_replyForwardSqs) _replyForwardSqs = new SQSClient({ region: config.region });
+  return _replyForwardSqs;
+}
+
 export async function invokeAgent(
   payload: InvocationPayload,
   logger: Logger,
@@ -675,6 +683,31 @@ async function sendChannelReply(
   replyOpts?: ReplyOptions,
 ): Promise<void> {
   try {
+    // Web-widget replies require the leader instance (which holds in-memory
+    // WebSocket connections). Other channels (Telegram, Discord, Slack, Feishu,
+    // DingTalk) use external REST APIs and can send from any instance — this
+    // block only affects web-widget.
+    if (channelType === 'web-widget') {
+      const widgetGw = getWebWidgetGatewayManager();
+      if (!widgetGw || !widgetGw.isLeader()) {
+        if (config.queues.replies) {
+          await replyForwardSqs().send(new SendMessageCommand({
+            QueueUrl: config.queues.replies,
+            MessageBody: JSON.stringify({
+              type: 'reply',
+              botId,
+              groupJid,
+              channelType,
+              text,
+              timestamp: new Date().toISOString(),
+            }),
+          }));
+          logger.info({ botId, groupJid }, 'Web-widget reply forwarded to reply queue for leader delivery');
+          return;
+        }
+      }
+    }
+
     const registry = getRegistry();
     const adapter = registry.get(channelType);
 
