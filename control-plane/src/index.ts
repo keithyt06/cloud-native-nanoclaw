@@ -5,6 +5,7 @@ import { timingSafeEqual } from 'node:crypto';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
+import websocket from '@fastify/websocket';
 import pino from 'pino';
 import { config, resolveConfig } from './config.js';
 import { healthRoutes } from './routes/health.js';
@@ -19,6 +20,7 @@ import { SlackAdapter } from './adapters/slack/index.js';
 import { TelegramAdapter } from './adapters/telegram/index.js';
 import { FeishuAdapter } from './adapters/feishu/index.js';
 import { DingTalkAdapter } from './adapters/dingtalk/index.js';
+import { WebWidgetAdapter } from './adapters/web-widget/index.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -29,6 +31,7 @@ async function main() {
 
   await app.register(cors, { origin: config.corsOrigin });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB max for skill zips
+  await app.register(websocket);
 
   // SEC-C05: Reject requests not coming through CloudFront (X-Origin-Verify header check).
   // The /health endpoint is exempt because ALB health checks go directly to the container.
@@ -62,8 +65,27 @@ async function main() {
   registry.register(new TelegramAdapter(logger));
   registry.register(new FeishuAdapter(logger));
   registry.register(new DingTalkAdapter(logger));
+  const webWidgetAdapter = new WebWidgetAdapter(logger);
+  registry.register(webWidgetAdapter);
   registry.startAll().catch((err) => {
     logger.error(err, 'Failed to start channel adapters');
+  });
+
+  // Web Widget WebSocket endpoint
+  app.get('/ws/widget', { websocket: true }, (socket, request) => {
+    const gateway = webWidgetAdapter.getGateway();
+    if (!gateway) {
+      socket.close(1013, 'Web Widget gateway not ready');
+      return;
+    }
+    if (!gateway.isLeader()) {
+      socket.close(1013, 'Not the leader instance, please reconnect');
+      return;
+    }
+    gateway.handleConnection(socket, request).catch((err) => {
+      logger.error({ err }, 'Error handling WebWidget WebSocket connection');
+      try { socket.close(1011, 'Internal error'); } catch { /* ignore */ }
+    });
   });
 
   // Graceful shutdown — release leader locks, drain in-flight SQS messages
